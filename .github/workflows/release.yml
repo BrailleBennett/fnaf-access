@@ -1,0 +1,115 @@
+name: Release Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_notes:
+        description: 'Optional custom release notes (auto-generated notes are used if left blank)'
+        required: false
+        default: ''
+        type: string
+      prerelease:
+        description: 'Mark this release as a pre-release'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Setup .NET 11
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '11.0.x'
+
+      - name: Compute next incrementing release number
+        id: version
+        shell: pwsh
+        run: |
+          $tags = git tag -l "v*"
+          $max = 0
+          foreach ($t in $tags) {
+            if ($t -match '^v(\d+)$') {
+              $num = [int]$Matches[1]
+              if ($num -gt $max) {
+                $max = $num
+              }
+            }
+          }
+
+          $next = $max + 1
+          $tag = "v$next"
+          $assemblyVersion = "1.0.$next"
+
+          Write-Host "Next release tag: $tag (AssemblyVersion: $assemblyVersion)"
+          "build_number=$next" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "assembly_version=$assemblyVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Publish self-contained win-x64 release
+        shell: pwsh
+        run: |
+          dotnet publish fnaf-access/fnaf-access.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:DebugType=none `
+            -p:DebugSymbols=false `
+            -p:Version="${{ steps.version.outputs.assembly_version }}" `
+            -o publish/fnaf-access
+
+      - name: Package release zip
+        id: package
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.version.outputs.tag }}"
+          $zipName = "fnaf-access-win-x64-$tag.zip"
+
+          if (Test-Path "README.md") {
+            Copy-Item "README.md" "publish/fnaf-access/README.md"
+          }
+
+          Compress-Archive -Path "publish/fnaf-access/*" -DestinationPath $zipName -Force
+          Write-Host "Created archive: $zipName"
+          "zip_name=$zipName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CUSTOM_NOTES: ${{ inputs.release_notes }}
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.version.outputs.tag }}"
+          $buildNum = "${{ steps.version.outputs.build_number }}"
+          $zipName = "${{ steps.package.outputs.zip_name }}"
+
+          $args = @(
+            "release", "create", $tag, $zipName,
+            "--title", "fnaf-access Build $buildNum ($tag)",
+            "--target", "${{ github.sha }}"
+          )
+
+          if ("${{ inputs.prerelease }}" -eq "true") {
+            $args += "--prerelease"
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:CUSTOM_NOTES)) {
+            $args += "--generate-notes"
+          } else {
+            $args += @("--notes", $env:CUSTOM_NOTES)
+          }
+
+          & gh @args
